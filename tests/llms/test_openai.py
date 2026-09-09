@@ -309,6 +309,52 @@ def test_gpt5_mini_not_classified_as_reasoning(mock_openai_client):
     assert call_kwargs[1].get("temperature") == 0.1
 
 
+def test_gpt5_mini_dash_variant_generates_reasoning_params(mock_openai_client):
+    """gpt-5-mini (no dot, the SDK's own bundled default — see server/main.py's
+    DEFAULT_LLM_MODEL) is a real reasoning model that rejects a non-default
+    temperature. It was missing from the reasoning_models set, which instead
+    listed "gpt-5o"/"gpt-5o-mini"/"gpt-5o-micro" — names not used anywhere else
+    in this codebase. Every fresh self-hosted install using default settings
+    hit a 400 from OpenAI ("temperature does not support 0.2 with this model")
+    on its first memory add. Regression test for that crash.
+    """
+    config = OpenAIConfig(model="gpt-5-mini", temperature=0.2, max_tokens=100)
+    llm = OpenAILLM(config)
+    messages = [{"role": "user", "content": "Hello"}]
+
+    mock_response = Mock()
+    mock_response.choices = [Mock(message=Mock(content="ok"))]
+    mock_openai_client.chat.completions.create.return_value = mock_response
+
+    llm.generate_response(messages)
+
+    call_kwargs = mock_openai_client.chat.completions.create.call_args.kwargs
+    assert "temperature" not in call_kwargs
+    assert "max_tokens" not in call_kwargs
+
+
+@pytest.mark.parametrize("model", ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"])
+def test_gpt56_family_generates_reasoning_params(mock_openai_client, model):
+    """The GPT-5.6 family (Luna/Terra/Sol, released 2026-07-09) are reasoning
+    models that reject temperature and top_p — OpenAI's API returns a 400 if
+    either is sent. Regression test to keep them recognized in reasoning_models.
+    """
+    config = OpenAIConfig(model=model, temperature=0.2, top_p=0.9, max_tokens=100)
+    llm = OpenAILLM(config)
+    messages = [{"role": "user", "content": "Hello"}]
+
+    mock_response = Mock()
+    mock_response.choices = [Mock(message=Mock(content="ok"))]
+    mock_openai_client.chat.completions.create.return_value = mock_response
+
+    llm.generate_response(messages)
+
+    call_kwargs = mock_openai_client.chat.completions.create.call_args.kwargs
+    assert "temperature" not in call_kwargs
+    assert "top_p" not in call_kwargs
+    assert "max_tokens" not in call_kwargs
+
+
 def test_is_reasoning_model_classification(mock_openai_client):
     """Test _is_reasoning_model correctly classifies known models."""
     config = OpenAIConfig(model="gpt-4.1")
@@ -319,6 +365,10 @@ def test_is_reasoning_model_classification(mock_openai_client):
     assert llm._is_reasoning_model("o3-mini") is True
     assert llm._is_reasoning_model("o3") is True
     assert llm._is_reasoning_model("gpt-5") is True
+    assert llm._is_reasoning_model("gpt-5-mini") is True
+    assert llm._is_reasoning_model("gpt-5.6-luna") is True
+    assert llm._is_reasoning_model("gpt-5.6-terra") is True
+    assert llm._is_reasoning_model("gpt-5.6-sol") is True
     assert llm._is_reasoning_model("o1-preview") is True
     assert llm._is_reasoning_model("o1-2024-12-17") is True
     assert llm._is_reasoning_model("openai/o3-mini") is True

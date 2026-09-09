@@ -24,7 +24,7 @@ docker-compose up
 
 - **Framework:** FastAPI on uvicorn, auto-reload in dev.
 - **Stores:** PostgreSQL with the pgvector extension, Neo4j 5.x with the APOC plugin.
-- **Hot reload:** the dev Dockerfile mounts both `server/` and `mem0/`, so SDK edits take effect without a rebuild.
+- **Hot reload:** `server/` is bind-mounted, so server code edits take effect on save (uvicorn `--reload`). `mem0/` is copied into the image at build time and installed editable, not bind-mounted — SDK edits need `docker-compose up --build` to take effect. The compose command must not reinstall `mem0ai` from PyPI at runtime; that overwrites the editable install with whatever's on PyPI, silently discarding any local/uncommitted SDK changes.
 - Use Docker Compose for local work. Do not add a "run it with uvicorn directly" path.
 - The server imports the Python SDK from the repo, so its conventions apply to any SDK code you touch: see [`../mem0/AGENTS.md`](../mem0/AGENTS.md).
 

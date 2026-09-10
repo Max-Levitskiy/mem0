@@ -79,6 +79,8 @@ services:
       - MEM0_BASE_URL=${MEM0_MCP_BASE_URL:-http://mem0:8000}
       - MEM0_API_KEY=${MEM0_MCP_API_KEY:?Set MEM0_MCP_API_KEY in .env to an API key minted from this server}
       - MCP_BEARER_TOKEN=${MCP_BEARER_TOKEN:?Set MCP_BEARER_TOKEN in .env — clients must send it as their bearer token}
+      - MEM0_DEFAULT_USER_ID=${MEM0_MCP_DEFAULT_USER_ID:-}
+      - MEM0_DEFAULT_AGENT_ID=${MEM0_MCP_DEFAULT_AGENT_ID:-}
     depends_on:
       mem0:
         condition: service_started

@@ -19,12 +19,33 @@ Config (env vars):
                       clients must send; guards against unauthenticated
                       internet traffic hitting (and billing) this endpoint.
   MCP_PORT           Port to listen on for http transport. Default 8000.
+  MEM0_DEFAULT_USER_ID   Applied when a tool call doesn't pass user_id. This
+                      is a single-user deployment, so every client should
+                      write to and read from the same user_id — otherwise
+                      "remember X in Claude Code, recall it in ChatGPT" only
+                      works if every client happens to pass an identical
+                      value, which isn't something an LLM reliably does on
+                      its own. Changing this later orphans memories stored
+                      under the old value; pick a stable value up front.
+  MEM0_DEFAULT_AGENT_ID  Fallback when a tool call doesn't pass agent_id and
+                      the request has no `agent` query param either (see
+                      below). Mainly useful for a stdio client, where each
+                      client's own MCP config can set this per-process.
 
 For local stdio use (a client's own MCP config, not the compose service),
 drop a .env file next to this script with MEM0_BASE_URL/MEM0_API_KEY set to
 your deployment's public URL and an API key from its dashboard — it's
 loaded automatically. The deployed container gets its env from Docker/
 Coolify directly, so this is a no-op there.
+
+Per-client agent_id over http transport: every MCP client configures a URL
+string, but not all of them reliably support custom headers, so per-client
+tagging goes through a `?agent=` query param on that URL instead — e.g.
+.../mcp?agent=claude-code vs .../mcp?agent=chatgpt. When a tool call omits
+agent_id, this is used automatically (still overridable by an explicit
+agent_id argument). user_id is deliberately NOT sourced from the request
+this way — it must stay identical across every client for recall to work,
+which is exactly what MEM0_DEFAULT_USER_ID guarantees regardless of source.
 """
 
 import os
@@ -33,7 +54,7 @@ from typing import Any
 
 import httpx
 from dotenv import load_dotenv
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 
 load_dotenv(Path(__file__).parent / ".env")
 
@@ -42,6 +63,8 @@ MEM0_API_KEY = os.environ.get("MEM0_API_KEY", "")
 MCP_TRANSPORT = os.environ.get("MCP_TRANSPORT", "stdio")
 MCP_BEARER_TOKEN = os.environ.get("MCP_BEARER_TOKEN", "")
 MCP_PORT = int(os.environ.get("MCP_PORT", "8000"))
+MEM0_DEFAULT_USER_ID = os.environ.get("MEM0_DEFAULT_USER_ID", "")
+MEM0_DEFAULT_AGENT_ID = os.environ.get("MEM0_DEFAULT_AGENT_ID", "")
 
 if not MEM0_API_KEY:
     raise RuntimeError("MEM0_API_KEY is required")
@@ -49,6 +72,41 @@ if MCP_TRANSPORT == "http" and not MCP_BEARER_TOKEN:
     raise RuntimeError("MCP_BEARER_TOKEN is required when MCP_TRANSPORT=http")
 
 mcp = FastMCP("mem0-self-hosted", host="0.0.0.0", port=MCP_PORT)
+
+
+def _client_agent_id(ctx: Context) -> str | None:
+    """agent_id from the request's ?agent= query param (http transport), or
+    MEM0_DEFAULT_AGENT_ID (mainly for a stdio client, one process per client)."""
+    request = getattr(ctx.request_context, "request", None) if ctx else None
+    if request is not None:
+        from_query = request.query_params.get("agent")
+        if from_query:
+            return from_query
+    return MEM0_DEFAULT_AGENT_ID or None
+
+
+def _resolve_write_ids(
+    ctx: Context, user_id: str | None, agent_id: str | None, run_id: str | None
+) -> tuple[str | None, str | None, str | None]:
+    """For add_memory: default both user_id and agent_id, so every write is
+    consistently tagged with who it's for and what stored it."""
+    resolved_user_id = user_id or MEM0_DEFAULT_USER_ID or None
+    resolved_agent_id = agent_id or _client_agent_id(ctx)
+    return resolved_user_id, resolved_agent_id, run_id
+
+
+def _resolve_read_ids(
+    ctx: Context, user_id: str | None, agent_id: str | None, run_id: str | None
+) -> tuple[str | None, str | None, str | None]:
+    """For search/list: default ONLY user_id. Auto-filling agent_id here would
+    silently scope every search to "what this one client stored", which
+    defeats the actual goal — recall that works no matter which client
+    added the memory. agent_id/run_id stay exactly as the caller passed them
+    (None = unfiltered = every agent), so pass agent_id explicitly only to
+    deliberately narrow a search to one client's own memories."""
+    resolved_user_id = user_id or MEM0_DEFAULT_USER_ID or None
+    return resolved_user_id, agent_id, run_id
+
 
 _client = httpx.Client(
     base_url=MEM0_BASE_URL,
@@ -78,6 +136,7 @@ def _normalize_messages(messages: str | list[dict[str, str]]) -> list[dict[str, 
 
 @mcp.tool()
 def add_memory(
+    ctx: Context,
     messages: str | list[dict[str, str]],
     user_id: str | None = None,
     agent_id: str | None = None,
@@ -87,7 +146,10 @@ def add_memory(
 ) -> Any:
     """Save text or a conversation to Mem0. `messages` can be a plain string
     (stored as a single user message) or a list of {role, content} dicts for
-    a full conversation. At least one of user_id, agent_id, run_id is required."""
+    a full conversation. user_id and agent_id default to this deployment's
+    configured identity if omitted — pass them explicitly only to deviate
+    from that (e.g. a specific run_id-scoped session)."""
+    user_id, agent_id, run_id = _resolve_write_ids(ctx, user_id, agent_id, run_id)
     if not any([user_id, agent_id, run_id]):
         raise RuntimeError("At least one of user_id, agent_id, run_id is required.")
     body: dict[str, Any] = {"messages": _normalize_messages(messages)}
@@ -105,6 +167,7 @@ def add_memory(
 
 @mcp.tool()
 def search_memories(
+    ctx: Context,
     query: str,
     user_id: str | None = None,
     agent_id: str | None = None,
@@ -112,8 +175,11 @@ def search_memories(
     top_k: int | None = None,
     threshold: float | None = None,
 ) -> Any:
-    """Semantic search across stored memories. Scope the search with at least
-    one of user_id, agent_id, run_id via the filters they map to."""
+    """Semantic search across stored memories. user_id defaults to this
+    deployment's configured identity if omitted, so a plain call searches
+    everything stored for that identity regardless of which client stored
+    it. Pass agent_id/run_id explicitly to narrow to a specific source."""
+    user_id, agent_id, run_id = _resolve_read_ids(ctx, user_id, agent_id, run_id)
     filters = {k: v for k, v in (("user_id", user_id), ("agent_id", agent_id), ("run_id", run_id)) if v}
     body: dict[str, Any] = {"query": query, "filters": filters}
     if top_k is not None:
@@ -125,12 +191,17 @@ def search_memories(
 
 @mcp.tool()
 def get_memories(
+    ctx: Context,
     user_id: str | None = None,
     agent_id: str | None = None,
     run_id: str | None = None,
     top_k: int | None = None,
 ) -> Any:
-    """List memories for a given user_id, agent_id, or run_id (at least one required)."""
+    """List memories. user_id defaults to this deployment's configured
+    identity if omitted, listing everything stored for that identity
+    regardless of which client stored it. Pass agent_id/run_id explicitly
+    to narrow to a specific source."""
+    user_id, agent_id, run_id = _resolve_read_ids(ctx, user_id, agent_id, run_id)
     if not any([user_id, agent_id, run_id]):
         raise RuntimeError("At least one of user_id, agent_id, run_id is required.")
     params = {k: v for k, v in (("user_id", user_id), ("agent_id", agent_id), ("run_id", run_id)) if v}
@@ -182,7 +253,10 @@ def delete_all_memories(
     run_id: str | None = None,
 ) -> Any:
     """Bulk-delete all memories for a given user_id, agent_id, or run_id
-    (at least one required). Requires an admin API key on the server."""
+    (at least one required — deliberately not defaulted like the read/write
+    tools, so this always needs an explicit, deliberate target instead of
+    silently becoming "wipe everything for the default identity" when
+    called with no arguments). Requires an admin API key on the server."""
     if not any([user_id, agent_id, run_id]):
         raise RuntimeError("At least one of user_id, agent_id, run_id is required.")
     params = {k: v for k, v in (("user_id", user_id), ("agent_id", agent_id), ("run_id", run_id)) if v}

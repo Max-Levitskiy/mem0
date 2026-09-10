@@ -19,13 +19,23 @@ Config (env vars):
                       clients must send; guards against unauthenticated
                       internet traffic hitting (and billing) this endpoint.
   MCP_PORT           Port to listen on for http transport. Default 8000.
+
+For local stdio use (a client's own MCP config, not the compose service),
+drop a .env file next to this script with MEM0_BASE_URL/MEM0_API_KEY set to
+your deployment's public URL and an API key from its dashboard — it's
+loaded automatically. The deployed container gets its env from Docker/
+Coolify directly, so this is a no-op there.
 """
 
 import os
+from pathlib import Path
 from typing import Any
 
 import httpx
+from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
+
+load_dotenv(Path(__file__).parent / ".env")
 
 MEM0_BASE_URL = os.environ.get("MEM0_BASE_URL", "http://mem0:8000").rstrip("/")
 MEM0_API_KEY = os.environ.get("MEM0_API_KEY", "")

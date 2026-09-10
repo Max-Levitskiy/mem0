@@ -27,25 +27,42 @@ Config (env vars):
                       value, which isn't something an LLM reliably does on
                       its own. Changing this later orphans memories stored
                       under the old value; pick a stable value up front.
-  MEM0_DEFAULT_AGENT_ID  Fallback when a tool call doesn't pass agent_id and
-                      the request has no `agent` query param either (see
-                      below). Mainly useful for a stdio client, where each
-                      client's own MCP config can set this per-process.
+  MEM0_AGENT_ID       Fallback when a tool call doesn't pass agent_id and the
+                      request has no `agent` query param either (see below).
+                      This is the project/repo identity, matching the mem0
+                      agent-plugin convention (one namespace per project) —
+                      not "which AI client called this".
+
+agent_id means project, sourced per transport:
+
+  stdio (Claude Code, Codex, Pi/OMP — anything launched from a terminal):
+  set MEM0_AGENT_ID in that project's .envrc (direnv). Since these tools
+  are (re)launched fresh from within the project directory, the spawned
+  server.py process inherits whatever .envrc exported for that shell —
+  no per-project MCP config needed, just one line per project's .envrc:
+
+      export MEM0_AGENT_ID=<project-name>
+
+  http (Claude Desktop, ChatGPT, or any client not launched per-project):
+  there's no shell to inherit from — these are persistent apps with no
+  concept of "current directory". Two options, in order of reliability:
+    - a `?agent=<project>` query param on that client's MCP URL, for a
+      client you only ever use for one fixed project;
+    - a custom-instruction / system-prompt line telling the model to pass
+      agent_id explicitly when a conversation is clearly project-specific
+      (see server/mcp/README or ask the deployer for the exact wording).
+  Whichever wins, it's still just a default — an explicit agent_id in the
+  tool call always overrides both.
+
+user_id is NOT sourced from either of these — it must stay identical
+across every client and every project for recall to work, which is
+exactly what MEM0_DEFAULT_USER_ID guarantees regardless of source.
 
 For local stdio use (a client's own MCP config, not the compose service),
 drop a .env file next to this script with MEM0_BASE_URL/MEM0_API_KEY set to
 your deployment's public URL and an API key from its dashboard — it's
 loaded automatically. The deployed container gets its env from Docker/
 Coolify directly, so this is a no-op there.
-
-Per-client agent_id over http transport: every MCP client configures a URL
-string, but not all of them reliably support custom headers, so per-client
-tagging goes through a `?agent=` query param on that URL instead — e.g.
-.../mcp?agent=claude-code vs .../mcp?agent=chatgpt. When a tool call omits
-agent_id, this is used automatically (still overridable by an explicit
-agent_id argument). user_id is deliberately NOT sourced from the request
-this way — it must stay identical across every client for recall to work,
-which is exactly what MEM0_DEFAULT_USER_ID guarantees regardless of source.
 """
 
 import os
@@ -64,7 +81,7 @@ MCP_TRANSPORT = os.environ.get("MCP_TRANSPORT", "stdio")
 MCP_BEARER_TOKEN = os.environ.get("MCP_BEARER_TOKEN", "")
 MCP_PORT = int(os.environ.get("MCP_PORT", "8000"))
 MEM0_DEFAULT_USER_ID = os.environ.get("MEM0_DEFAULT_USER_ID", "")
-MEM0_DEFAULT_AGENT_ID = os.environ.get("MEM0_DEFAULT_AGENT_ID", "")
+MEM0_AGENT_ID = os.environ.get("MEM0_AGENT_ID", "")
 
 if not MEM0_API_KEY:
     raise RuntimeError("MEM0_API_KEY is required")
@@ -74,36 +91,40 @@ if MCP_TRANSPORT == "http" and not MCP_BEARER_TOKEN:
 mcp = FastMCP("mem0-self-hosted", host="0.0.0.0", port=MCP_PORT)
 
 
-def _client_agent_id(ctx: Context) -> str | None:
-    """agent_id from the request's ?agent= query param (http transport), or
-    MEM0_DEFAULT_AGENT_ID (mainly for a stdio client, one process per client)."""
+def _project_agent_id(ctx: Context) -> str | None:
+    """agent_id (project identity) from MEM0_AGENT_ID — set per-project via
+    .envrc for a stdio client — or a `?agent=` query param for an http
+    client with no shell/cwd to inherit an env var from."""
     request = getattr(ctx.request_context, "request", None) if ctx else None
     if request is not None:
         from_query = request.query_params.get("agent")
         if from_query:
             return from_query
-    return MEM0_DEFAULT_AGENT_ID or None
+    return MEM0_AGENT_ID or None
 
 
 def _resolve_write_ids(
     ctx: Context, user_id: str | None, agent_id: str | None, run_id: str | None
 ) -> tuple[str | None, str | None, str | None]:
-    """For add_memory: default both user_id and agent_id, so every write is
-    consistently tagged with who it's for and what stored it."""
+    """For add_memory: default both user_id (who) and agent_id (which project),
+    so every write is consistently tagged without the caller having to know
+    or pass either."""
     resolved_user_id = user_id or MEM0_DEFAULT_USER_ID or None
-    resolved_agent_id = agent_id or _client_agent_id(ctx)
+    resolved_agent_id = agent_id or _project_agent_id(ctx)
     return resolved_user_id, resolved_agent_id, run_id
 
 
 def _resolve_read_ids(
     ctx: Context, user_id: str | None, agent_id: str | None, run_id: str | None
 ) -> tuple[str | None, str | None, str | None]:
-    """For search/list: default ONLY user_id. Auto-filling agent_id here would
-    silently scope every search to "what this one client stored", which
-    defeats the actual goal — recall that works no matter which client
-    added the memory. agent_id/run_id stay exactly as the caller passed them
-    (None = unfiltered = every agent), so pass agent_id explicitly only to
-    deliberately narrow a search to one client's own memories."""
+    """For search/list: default ONLY user_id, deliberately leaving agent_id
+    unfiltered (None) unless the caller passes one explicitly. Mirrors the
+    mem0 agent-plugin model this project_id convention comes from: a search
+    is the union of project-scoped memory and cross-project personal
+    memory, not project-scoped alone — auto-filtering by the current
+    project here would hide the general "I prefer X" facts that should
+    surface no matter which project you're currently in. Pass agent_id
+    explicitly only to deliberately narrow to one project's memories."""
     resolved_user_id = user_id or MEM0_DEFAULT_USER_ID or None
     return resolved_user_id, agent_id, run_id
 
@@ -177,8 +198,9 @@ def search_memories(
 ) -> Any:
     """Semantic search across stored memories. user_id defaults to this
     deployment's configured identity if omitted, so a plain call searches
-    everything stored for that identity regardless of which client stored
-    it. Pass agent_id/run_id explicitly to narrow to a specific source."""
+    everything stored for that identity regardless of which project it was
+    stored under. Pass agent_id to narrow to one project's memories, or
+    run_id to narrow further to one session."""
     user_id, agent_id, run_id = _resolve_read_ids(ctx, user_id, agent_id, run_id)
     filters = {k: v for k, v in (("user_id", user_id), ("agent_id", agent_id), ("run_id", run_id)) if v}
     body: dict[str, Any] = {"query": query, "filters": filters}
@@ -199,8 +221,9 @@ def get_memories(
 ) -> Any:
     """List memories. user_id defaults to this deployment's configured
     identity if omitted, listing everything stored for that identity
-    regardless of which client stored it. Pass agent_id/run_id explicitly
-    to narrow to a specific source."""
+    regardless of which project it was stored under. Pass agent_id to
+    narrow to one project's memories, or run_id to narrow further to one
+    session."""
     user_id, agent_id, run_id = _resolve_read_ids(ctx, user_id, agent_id, run_id)
     if not any([user_id, agent_id, run_id]):
         raise RuntimeError("At least one of user_id, agent_id, run_id is required.")

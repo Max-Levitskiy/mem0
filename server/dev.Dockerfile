@@ -10,8 +10,11 @@ ENV PATH="/root/.local/bin:$PATH"
 COPY server/requirements.txt .
 RUN pip install -r requirements.txt
 
-# Install mem0 in editable mode using Poetry
-WORKDIR /app/packages
+# Install mem0 in editable mode using Poetry. This lives outside /app
+# (not /app/packages) so the compose service's `.:/app` bind mount — which
+# maps only the server/ directory — can't shadow it. Only server/ code
+# hot-reloads via that mount; mem0/ changes need an image rebuild.
+WORKDIR /packages
 COPY pyproject.toml .
 COPY poetry.lock .
 COPY README.md .

@@ -13,11 +13,10 @@ gap for this specific deployment, over either transport:
 Config (env vars):
   MEM0_BASE_URL      Base URL of the self-hosted REST API.
                       Defaults to http://mem0:8000 (the compose service name).
-  MEM0_API_KEY       X-API-Key this server uses to call that API. Required.
+  MEM0_API_KEY       X-API-Key this server uses to call that API, for a
+                      stdio client only (see "Auth" below). Not read at all
+                      for http transport.
   MCP_TRANSPORT      stdio (default) or http.
-  MCP_BEARER_TOKEN   Required when MCP_TRANSPORT=http. Static bearer token
-                      clients must send; guards against unauthenticated
-                      internet traffic hitting (and billing) this endpoint.
   MCP_PORT           Port to listen on for http transport. Default 8000.
   MEM0_DEFAULT_USER_ID   Applied when a tool call doesn't pass user_id. This
                       is a single-user deployment, so every client should
@@ -32,6 +31,24 @@ Config (env vars):
                       This is the project/repo identity, matching the mem0
                       agent-plugin convention (one namespace per project) —
                       not "which AI client called this".
+
+Auth: no separate secret for this server — a caller's own mem0 API key
+(minted from this deployment's dashboard, Settings > API Keys) IS the
+credential, sourced per transport:
+
+  http: the client's Authorization: Bearer <mem0 API key> header is used
+  directly as X-API-Key on the underlying REST call, per request. Mint one
+  dedicated, labeled key per http client (e.g. "chatgpt-mcp",
+  "claude-desktop-mcp") so each is independently revocable from the
+  dashboard without affecting the others — same UI you already use to
+  manage keys, nothing new to learn. An invalid or revoked key isn't
+  rejected here; it's rejected by the REST API itself on the first real
+  call, which is the actual source of truth for whether a key is valid.
+
+  stdio: there's no per-request Authorization header to read, so
+  MEM0_API_KEY (in that client's own .env next to this script, or its MCP
+  config's env block) is used for every call from that process — same
+  idea, just one key per local client instead of per HTTP request.
 
 agent_id means project, sourced per transport:
 
@@ -78,24 +95,44 @@ load_dotenv(Path(__file__).parent / ".env")
 MEM0_BASE_URL = os.environ.get("MEM0_BASE_URL", "http://mem0:8000").rstrip("/")
 MEM0_API_KEY = os.environ.get("MEM0_API_KEY", "")
 MCP_TRANSPORT = os.environ.get("MCP_TRANSPORT", "stdio")
-MCP_BEARER_TOKEN = os.environ.get("MCP_BEARER_TOKEN", "")
 MCP_PORT = int(os.environ.get("MCP_PORT", "8000"))
 MEM0_DEFAULT_USER_ID = os.environ.get("MEM0_DEFAULT_USER_ID", "")
 MEM0_AGENT_ID = os.environ.get("MEM0_AGENT_ID", "")
 
-if not MEM0_API_KEY:
-    raise RuntimeError("MEM0_API_KEY is required")
-if MCP_TRANSPORT == "http" and not MCP_BEARER_TOKEN:
-    raise RuntimeError("MCP_BEARER_TOKEN is required when MCP_TRANSPORT=http")
+if MCP_TRANSPORT == "stdio" and not MEM0_API_KEY:
+    raise RuntimeError("MEM0_API_KEY is required for stdio transport (no per-request auth exists there).")
 
 mcp = FastMCP("mem0-self-hosted", host="0.0.0.0", port=MCP_PORT)
+
+
+def _http_request(ctx: Context) -> Any:
+    return getattr(ctx.request_context, "request", None) if ctx else None
+
+
+def _resolve_api_key(ctx: Context) -> str:
+    """The X-API-Key for this call: the caller's own bearer token (their own
+    dashboard-issued key) for http, or MEM0_API_KEY for stdio."""
+    request = _http_request(ctx)
+    if request is not None:
+        auth_header = request.headers.get("authorization", "")
+        if auth_header.lower().startswith("bearer "):
+            token = auth_header[7:].strip()
+            if token:
+                return token
+        raise RuntimeError(
+            "Missing or malformed Authorization header. Send 'Authorization: Bearer <mem0 API key>', "
+            "using a key minted from this deployment's dashboard (Settings > API Keys)."
+        )
+    if not MEM0_API_KEY:
+        raise RuntimeError("MEM0_API_KEY is not set for this stdio process.")
+    return MEM0_API_KEY
 
 
 def _project_agent_id(ctx: Context) -> str | None:
     """agent_id (project identity) from MEM0_AGENT_ID — set per-project via
     .envrc for a stdio client — or a `?agent=` query param for an http
     client with no shell/cwd to inherit an env var from."""
-    request = getattr(ctx.request_context, "request", None) if ctx else None
+    request = _http_request(ctx)
     if request is not None:
         from_query = request.query_params.get("agent")
         if from_query:
@@ -129,15 +166,12 @@ def _resolve_read_ids(
     return resolved_user_id, agent_id, run_id
 
 
-_client = httpx.Client(
-    base_url=MEM0_BASE_URL,
-    headers={"X-API-Key": MEM0_API_KEY, "Content-Type": "application/json"},
-    timeout=30.0,
-)
+_client = httpx.Client(base_url=MEM0_BASE_URL, headers={"Content-Type": "application/json"}, timeout=30.0)
 
 
-def _request(method: str, path: str, **kwargs) -> Any:
-    resp = _client.request(method, path, **kwargs)
+def _request(ctx: Context, method: str, path: str, **kwargs) -> Any:
+    headers = {"X-API-Key": _resolve_api_key(ctx)}
+    resp = _client.request(method, path, headers=headers, **kwargs)
     if resp.status_code >= 400:
         try:
             detail = resp.json().get("detail", resp.text)
@@ -183,7 +217,7 @@ def add_memory(
     ):
         if value is not None:
             body[key] = value
-    return _request("POST", "/memories", json=body)
+    return _request(ctx, "POST", "/memories", json=body)
 
 
 @mcp.tool()
@@ -208,7 +242,7 @@ def search_memories(
         body["top_k"] = top_k
     if threshold is not None:
         body["threshold"] = threshold
-    return _request("POST", "/search", json=body)
+    return _request(ctx, "POST", "/search", json=body)
 
 
 @mcp.tool()
@@ -230,23 +264,24 @@ def get_memories(
     params = {k: v for k, v in (("user_id", user_id), ("agent_id", agent_id), ("run_id", run_id)) if v}
     if top_k is not None:
         params["top_k"] = top_k
-    return _request("GET", "/memories", params=params)
+    return _request(ctx, "GET", "/memories", params=params)
 
 
 @mcp.tool()
-def get_memory(memory_id: str) -> Any:
+def get_memory(ctx: Context, memory_id: str) -> Any:
     """Retrieve a single memory by its ID."""
-    return _request("GET", f"/memories/{memory_id}")
+    return _request(ctx, "GET", f"/memories/{memory_id}")
 
 
 @mcp.tool()
-def get_memory_history(memory_id: str) -> Any:
+def get_memory_history(ctx: Context, memory_id: str) -> Any:
     """Get the change history for a single memory."""
-    return _request("GET", f"/memories/{memory_id}/history")
+    return _request(ctx, "GET", f"/memories/{memory_id}/history")
 
 
 @mcp.tool()
 def update_memory(
+    ctx: Context,
     memory_id: str,
     text: str | None = None,
     metadata: dict[str, Any] | None = None,
@@ -260,17 +295,18 @@ def update_memory(
         body["metadata"] = metadata
     if not body:
         raise RuntimeError("Provide text and/or metadata to update.")
-    return _request("PUT", f"/memories/{memory_id}", json=body)
+    return _request(ctx, "PUT", f"/memories/{memory_id}", json=body)
 
 
 @mcp.tool()
-def delete_memory(memory_id: str) -> Any:
+def delete_memory(ctx: Context, memory_id: str) -> Any:
     """Delete a single memory by its ID."""
-    return _request("DELETE", f"/memories/{memory_id}")
+    return _request(ctx, "DELETE", f"/memories/{memory_id}")
 
 
 @mcp.tool()
 def delete_all_memories(
+    ctx: Context,
     user_id: str | None = None,
     agent_id: str | None = None,
     run_id: str | None = None,
@@ -283,7 +319,7 @@ def delete_all_memories(
     if not any([user_id, agent_id, run_id]):
         raise RuntimeError("At least one of user_id, agent_id, run_id is required.")
     params = {k: v for k, v in (("user_id", user_id), ("agent_id", agent_id), ("run_id", run_id)) if v}
-    return _request("DELETE", "/memories", params=params)
+    return _request(ctx, "DELETE", "/memories", params=params)
 
 
 def _build_http_app():
@@ -291,14 +327,21 @@ def _build_http_app():
     from starlette.requests import Request
     from starlette.responses import JSONResponse
 
-    class BearerAuthMiddleware(BaseHTTPMiddleware):
+    class RequireBearerMiddleware(BaseHTTPMiddleware):
+        """Reject requests with no Authorization header at all, before they
+        reach the MCP session layer. This is NOT the real auth check — it's
+        just a cheap filter against completely anonymous traffic. The real
+        check is each tool call trying the caller's token as X-API-Key
+        against the actual REST API, which is the only source of truth for
+        whether a given mem0 API key is valid."""
+
         async def dispatch(self, request: Request, call_next):
-            if request.headers.get("authorization") != f"Bearer {MCP_BEARER_TOKEN}":
-                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            if not request.headers.get("authorization", "").lower().startswith("bearer "):
+                return JSONResponse({"error": "Missing Authorization: Bearer <mem0 API key> header."}, status_code=401)
             return await call_next(request)
 
     app = mcp.streamable_http_app()
-    app.add_middleware(BearerAuthMiddleware)
+    app.add_middleware(RequireBearerMiddleware)
     return app
 
 

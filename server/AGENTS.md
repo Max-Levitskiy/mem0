@@ -41,5 +41,8 @@ files upstream (`mem0ai/mem0`) actively maintains, since this is a fork with
 its own deployment concerns. See [`mcp/server.py`](mcp/server.py)'s module
 docstring for its env vars. `MCP_TRANSPORT=stdio` runs it as a local process
 for a client's own MCP config; `http` (what the compose service runs) serves
-streamable-http behind a static bearer-token gate — not a full OAuth
-resource server, since this is a single-user deployment, not a public one.
+streamable-http. No separate server secret either way — a caller's own
+dashboard-issued mem0 API key (Settings > API Keys) is the credential,
+sent as `Authorization: Bearer <key>` for http or `MEM0_API_KEY` in env
+for stdio, used directly as `X-API-Key` against the REST API. Mint one
+labeled key per client so each is independently revocable.

@@ -1,5 +1,11 @@
-"""One-off script: exercise the deployed HTTP MCP server end to end,
-including the bearer-auth gate. Not part of the shipped image."""
+"""One-off script: exercise the deployed HTTP MCP server end to end. TOKEN
+must be a real mem0 API key minted from the deployment's dashboard
+(Settings > API Keys) — there's no separate MCP-only secret; the caller's
+own bearer token is used directly as X-API-Key against the REST API. Not
+part of the shipped image.
+
+    python test_http_live.py [url] [mem0-api-key]
+"""
 
 import asyncio
 import json
@@ -9,7 +15,10 @@ from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 
 URL = sys.argv[1] if len(sys.argv) > 1 else "http://localhost:8767/mcp"
-TOKEN = sys.argv[2] if len(sys.argv) > 2 else "test-bearer-secret-12345"
+TOKEN = sys.argv[2] if len(sys.argv) > 2 else ""
+
+if not TOKEN:
+    raise SystemExit("Usage: python test_http_live.py [url] <mem0-api-key>")
 
 
 async def try_without_auth():

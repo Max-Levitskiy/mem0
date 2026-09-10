@@ -5,12 +5,14 @@ add_memory tags both identifiers from server-side config/query-param
 default only user_id, so a memory added under one project is still found
 by a search that doesn't name a project. Point it at a local
 `python server.py` (MCP_TRANSPORT=http) with MEM0_DEFAULT_USER_ID set.
-Not part of the shipped image.
+TOKEN must be a real mem0 API key from the target deployment's dashboard
+(Settings > API Keys) — there's no separate MCP-only secret; it's used
+directly as X-API-Key. Not part of the shipped image.
 
-    MEM0_BASE_URL=https://your-deployment MEM0_API_KEY=... \
-    MCP_TRANSPORT=http MCP_BEARER_TOKEN=test MCP_PORT=8899 \
+    MEM0_BASE_URL=https://your-deployment \
+    MCP_TRANSPORT=http MCP_PORT=8899 \
     MEM0_DEFAULT_USER_ID=max python server.py &
-    python test_identity_defaults.py [base_url] [bearer_token]
+    python test_identity_defaults.py [base_url] <mem0-api-key>
 """
 
 import asyncio
@@ -21,7 +23,10 @@ from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 
 BASE_URL = sys.argv[1] if len(sys.argv) > 1 else "http://localhost:8899/mcp"
-TOKEN = sys.argv[2] if len(sys.argv) > 2 else "local-test-token-xyz"
+TOKEN = sys.argv[2] if len(sys.argv) > 2 else ""
+
+if not TOKEN:
+    raise SystemExit("Usage: python test_identity_defaults.py [base_url] <mem0-api-key>")
 
 
 async def call(url: str, tool: str, args: dict):

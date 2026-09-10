@@ -17,6 +17,7 @@ docker-compose up
 |---------|------|
 | mem0 API | 8888 |
 | PostgreSQL (pgvector) | 8432 |
+| mem0-mcp (optional, `mcp/`) | 8767 |
 | Neo4j HTTP | 8474 |
 | Neo4j Bolt | 8687 |
 
@@ -29,3 +30,16 @@ docker-compose up
 - The server imports the Python SDK from the repo, so its conventions apply to any SDK code you touch: see [`../mem0/AGENTS.md`](../mem0/AGENTS.md).
 
 Never commit `.env`. Credentials for the compose services belong in `.env.example` as placeholders only.
+
+## MCP server (`mcp/`, optional)
+
+Wraps the self-hosted REST API as MCP tools, for clients that speak MCP but
+not this server's REST shape (the official Mem0 MCP server and agent plugins
+only target the hosted Mem0 Platform's versioned API). Its own service in
+`docker-compose.yaml`, not merged into `main.py` — the goal is zero diff on
+files upstream (`mem0ai/mem0`) actively maintains, since this is a fork with
+its own deployment concerns. See [`mcp/server.py`](mcp/server.py)'s module
+docstring for its env vars. `MCP_TRANSPORT=stdio` runs it as a local process
+for a client's own MCP config; `http` (what the compose service runs) serves
+streamable-http behind a static bearer-token gate — not a full OAuth
+resource server, since this is a single-user deployment, not a public one.
